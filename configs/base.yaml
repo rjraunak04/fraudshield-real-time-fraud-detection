@@ -1,0 +1,20 @@
+project:
+  name: "FraudShield"
+  version: "0.1.0"
+  random_seed: 42
+
+data:
+  transaction_id: "TRANSACTION_ID"
+  timestamp: "TX_DATETIME"
+  target: "TX_FRAUD"
+
+modeling:
+  excluded_features:
+    - "TX_FRAUD"
+    - "TX_FRAUD_SCENARIO"
+
+validation:
+  require_unique_transaction_id: true
+  require_non_negative_amount: true
+  require_binary_target: true
+  require_valid_timestamp: true
