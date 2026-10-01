@@ -72,6 +72,7 @@ def validate_transactions(df: pd.DataFrame) -> None:
     parsed_datetime = pd.to_datetime(
         df["TX_DATETIME"],
         errors="coerce",
+        format="mixed",
     )
 
     if parsed_datetime.isna().any():
