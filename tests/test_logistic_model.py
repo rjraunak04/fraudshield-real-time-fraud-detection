@@ -339,3 +339,82 @@ def test_coefficient_table_sorted_by_magnitude() -> None:
         magnitudes[:-1]
         >= magnitudes[1:]
     )
+def test_fit_classifier_accepts_sample_weights() -> None:
+    """Training should support positive per-row sample weights."""
+    partition = make_partition()
+
+    weights = np.where(
+        partition.y.to_numpy() == 1,
+        5.0,
+        1.0,
+    )
+
+    trained = fit_classifier(
+        build_logistic_regression(),
+        partition,
+        sample_weight=weights,
+    )
+
+    probabilities = predict_fraud_probabilities(
+        trained,
+        partition,
+    )
+
+    assert len(probabilities) == len(partition.X)
+
+
+def test_fit_classifier_rejects_wrong_sample_weight_length() -> None:
+    """Sample weights must align with training observations."""
+    partition = make_partition()
+
+    with pytest.raises(
+        ValueError,
+        match="length",
+    ):
+        fit_classifier(
+            build_logistic_regression(),
+            partition,
+            sample_weight=np.ones(
+                len(partition.y) - 1
+            ),
+        )
+
+
+def test_fit_classifier_rejects_non_positive_sample_weights() -> None:
+    """Sample weights must be strictly positive."""
+    partition = make_partition()
+
+    weights = np.ones(
+        len(partition.y)
+    )
+    weights[0] = 0.0
+
+    with pytest.raises(
+        ValueError,
+        match="positive",
+    ):
+        fit_classifier(
+            build_logistic_regression(),
+            partition,
+            sample_weight=weights,
+        )
+
+
+def test_fit_classifier_rejects_non_finite_sample_weights() -> None:
+    """Sample weights must be finite."""
+    partition = make_partition()
+
+    weights = np.ones(
+        len(partition.y)
+    )
+    weights[0] = np.nan
+
+    with pytest.raises(
+        ValueError,
+        match="non-finite",
+    ):
+        fit_classifier(
+            build_logistic_regression(),
+            partition,
+            sample_weight=weights,
+        )
