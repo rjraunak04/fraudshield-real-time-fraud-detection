@@ -1,0 +1,185 @@
+"""FastAPI application for FraudShield inference."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Protocol
+
+from fastapi import FastAPI, HTTPException
+
+from fraudshield.api.schemas import (
+    HealthResponse,
+    ReasonCodeResponse,
+    ScoreRequest,
+    ScoreResponse,
+)
+from fraudshield.decision.engine import RiskDecisionEngine
+from fraudshield.explainability.reason_codes import ReasonCode
+from fraudshield.scoring.service import FraudScore
+
+
+class ScoringService(Protocol):
+    """Protocol required by the HTTP layer."""
+
+    def score_one(
+        self,
+        transaction: dict[str, float],
+    ) -> FraudScore:
+        """Score one engineered transaction."""
+        ...
+
+
+class ReasonService(Protocol):
+    """Protocol for optional local explanations."""
+
+    def explain(
+        self,
+        transaction: dict[str, float],
+    ) -> tuple[ReasonCode, ...]:
+        """Return reviewer-facing reason codes."""
+        ...
+
+
+def _unconfigured_scorer() -> ScoringService:
+    """Fail safely until a fitted scorer is injected."""
+    raise RuntimeError(
+        "FraudShield scoring service is not configured."
+    )
+
+
+def create_app(
+    *,
+    scorer_dependency: Callable[
+        [],
+        ScoringService,
+    ] = _unconfigured_scorer,
+    reason_dependency: Callable[
+        [],
+        ReasonService | None,
+    ]
+    | None = None,
+    decision_engine: RiskDecisionEngine | None = None,
+) -> FastAPI:
+    """Create the FraudShield HTTP application."""
+    app = FastAPI(
+        title="FraudShield",
+        version="0.1.0",
+        description=(
+            "Real-time fraud scoring and "
+            "risk decision service."
+        ),
+    )
+
+    engine = (
+        decision_engine
+        or RiskDecisionEngine()
+    )
+
+    @app.get(
+        "/health",
+        response_model=HealthResponse,
+        tags=["system"],
+    )
+    def health() -> HealthResponse:
+        """Return API process health."""
+        return HealthResponse(
+            status="ok",
+            service="fraudshield",
+        )
+
+    @app.post(
+        "/v1/score",
+        response_model=ScoreResponse,
+        tags=["inference"],
+    )
+    def score_transaction(
+        request: ScoreRequest,
+    ) -> ScoreResponse:
+        """Score and classify one engineered transaction."""
+        features = request.to_model_features()
+
+        try:
+            scorer = scorer_dependency()
+
+            score = scorer.score_one(
+                features
+            )
+
+            reasons: tuple[
+                ReasonCode,
+                ...
+            ] = ()
+
+            if reason_dependency is not None:
+                reason_service = (
+                    reason_dependency()
+                )
+
+                if reason_service is not None:
+                    reasons = (
+                        reason_service.explain(
+                            features
+                        )
+                    )
+
+            decision = engine.decide(
+                score,
+                reason_codes=reasons,
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Fraud scoring failed safely."
+                ),
+            ) from exc
+
+        return ScoreResponse(
+            action=decision.action.value,
+            raw_probability=(
+                score.raw_probability
+            ),
+            calibrated_probability=(
+                score.calibrated_probability
+            ),
+            review_threshold=(
+                decision.review_threshold
+            ),
+            block_threshold=(
+                decision.block_threshold
+            ),
+            model_version=(
+                decision.model_version
+            ),
+            calibration_method=(
+                decision.calibration_method
+            ),
+            policy_version=(
+                decision.policy_version
+            ),
+            reason_codes=[
+                ReasonCodeResponse(
+                    code=reason.code,
+                    message=reason.message,
+                    feature=reason.feature,
+                    direction=reason.direction,
+                    probability_change=(
+                        reason.probability_change
+                    ),
+                    rank=reason.rank,
+                )
+                for reason in (
+                    decision.reason_codes
+                )
+            ],
+        )
+
+    return app
+
+
+app = create_app()
