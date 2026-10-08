@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable
 from typing import Protocol
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
+from fraudshield.api.observability import (
+    elapsed_ms,
+    log_event,
+    new_request_id,
+)
 from fraudshield.api.schemas import (
     HealthResponse,
     ReasonCodeResponse,
@@ -16,6 +24,8 @@ from fraudshield.api.schemas import (
 from fraudshield.decision.engine import RiskDecisionEngine
 from fraudshield.explainability.reason_codes import ReasonCode
 from fraudshield.scoring.service import FraudScore
+
+logger = logging.getLogger("fraudshield.api")
 
 
 class ScoringService(Protocol):
@@ -70,10 +80,75 @@ def create_app(
         ),
     )
 
-    engine = (
-        decision_engine
-        or RiskDecisionEngine()
-    )
+    engine = decision_engine or RiskDecisionEngine()
+
+    @app.middleware("http")
+    async def observability_middleware(
+        request: Request,
+        call_next,
+    ):
+        request_id = (
+            request.headers.get("X-Request-ID")
+            or new_request_id()
+        )
+        started_at = time.perf_counter()
+
+        log_event(
+            "request_started",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+        )
+
+        try:
+            response = await call_next(request)
+        except Exception:
+            latency = elapsed_ms(started_at)
+
+            logger.exception(
+                "Unhandled API exception",
+                extra={
+                    "request_id": request_id,
+                    "path": request.url.path,
+                },
+            )
+
+            log_event(
+                "request_failed",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                latency_ms=round(latency, 3),
+            )
+
+            response = JSONResponse(
+                status_code=500,
+                content={
+                    "detail": (
+                        "Internal service error."
+                    )
+                },
+            )
+
+        latency = elapsed_ms(started_at)
+
+        response.headers["X-Request-ID"] = (
+            request_id
+        )
+        response.headers["X-Process-Time-Ms"] = (
+            f"{latency:.3f}"
+        )
+
+        log_event(
+            "request_completed",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            latency_ms=round(latency, 3),
+        )
+
+        return response
 
     @app.get(
         "/health",
@@ -81,9 +156,36 @@ def create_app(
         tags=["system"],
     )
     def health() -> HealthResponse:
-        """Return API process health."""
+        """Return API process liveness."""
         return HealthResponse(
             status="ok",
+            service="fraudshield",
+        )
+
+    @app.get(
+        "/ready",
+        response_model=HealthResponse,
+        tags=["system"],
+    )
+    def readiness() -> HealthResponse:
+        """Return service readiness."""
+        try:
+            scorer_dependency()
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Fraud scoring service "
+                    "is not ready."
+                ),
+            ) from exc
+
+        return HealthResponse(
+            status="ready",
             service="fraudshield",
         )
 
@@ -101,9 +203,7 @@ def create_app(
         try:
             scorer = scorer_dependency()
 
-            score = scorer.score_one(
-                features
-            )
+            score = scorer.score_one(features)
 
             reasons: tuple[
                 ReasonCode,
@@ -111,15 +211,11 @@ def create_app(
             ] = ()
 
             if reason_dependency is not None:
-                reason_service = (
-                    reason_dependency()
-                )
+                reason_service = reason_dependency()
 
                 if reason_service is not None:
-                    reasons = (
-                        reason_service.explain(
-                            features
-                        )
+                    reasons = reason_service.explain(
+                        features
                     )
 
             decision = engine.decide(
@@ -141,9 +237,7 @@ def create_app(
 
         return ScoreResponse(
             action=decision.action.value,
-            raw_probability=(
-                score.raw_probability
-            ),
+            raw_probability=score.raw_probability,
             calibrated_probability=(
                 score.calibrated_probability
             ),
@@ -153,9 +247,7 @@ def create_app(
             block_threshold=(
                 decision.block_threshold
             ),
-            model_version=(
-                decision.model_version
-            ),
+            model_version=decision.model_version,
             calibration_method=(
                 decision.calibration_method
             ),
@@ -173,9 +265,7 @@ def create_app(
                     ),
                     rank=reason.rank,
                 )
-                for reason in (
-                    decision.reason_codes
-                )
+                for reason in decision.reason_codes
             ],
         )
 
