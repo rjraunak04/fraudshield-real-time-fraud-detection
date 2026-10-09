@@ -1,4 +1,4 @@
-"""Repository layer for durable FraudShield decision history."""
+"""Repository for durable fraud decision history."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from fraudshield.persistence.models import FraudDecisionRecord
 
 @dataclass(frozen=True, slots=True)
 class FraudDecisionWrite:
-    """Persistence input for one scored transaction."""
+    """Data required to persist one fraud decision."""
 
     transaction_id: int
     event_time: datetime
@@ -29,14 +29,22 @@ class FraudDecisionWrite:
 
 
 class DuplicateDecisionError(ValueError):
-    """Raised when a transaction already has a persisted decision."""
+    """Raised when a transaction decision already exists."""
 
 
 class FraudDecisionRepository:
-    """Repository for FraudShield decision audit records."""
+    """Persistence operations for fraud decisions."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(
+        self,
+        session: Session,
+    ) -> None:
         self._session = session
+
+    @property
+    def session(self) -> Session:
+        """Expose session for read-only aggregate queries."""
+        return self._session
 
     def add(
         self,
@@ -50,7 +58,9 @@ class FraudDecisionRepository:
             terminal_id=decision.terminal_id,
             amount=decision.amount,
             raw_probability=decision.raw_probability,
-            calibrated_probability=decision.calibrated_probability,
+            calibrated_probability=(
+                decision.calibrated_probability
+            ),
             decision=decision.decision,
             model_version=decision.model_version,
             policy_version=decision.policy_version,
@@ -62,8 +72,9 @@ class FraudDecisionRepository:
             self._session.flush()
         except IntegrityError as exc:
             self._session.rollback()
+
             raise DuplicateDecisionError(
-                "A decision already exists for transaction "
+                f"Decision already exists for transaction "
                 f"{decision.transaction_id}."
             ) from exc
 
@@ -73,21 +84,25 @@ class FraudDecisionRepository:
         self,
         transaction_id: int,
     ) -> FraudDecisionRecord | None:
-        """Return the decision for one transaction."""
-        statement = select(FraudDecisionRecord).where(
-            FraudDecisionRecord.transaction_id == transaction_id
+        """Return one decision by transaction ID."""
+        statement = select(
+            FraudDecisionRecord
+        ).where(
+            FraudDecisionRecord.transaction_id
+            == transaction_id
         )
 
         return self._session.scalar(statement)
 
     def recent(
         self,
-        *,
         limit: int = 100,
     ) -> list[FraudDecisionRecord]:
-        """Return most recently persisted decisions."""
+        """Return most recent fraud decisions."""
         if limit <= 0:
-            raise ValueError("limit must be greater than zero.")
+            raise ValueError(
+                "limit must be greater than zero."
+            )
 
         statement = (
             select(FraudDecisionRecord)
@@ -99,15 +114,15 @@ class FraudDecisionRepository:
         )
 
         return list(
-            self._session.scalars(statement).all()
+            self._session.scalars(statement)
         )
 
     def count(self) -> int:
-        """Return total persisted decision count."""
+        """Return total number of persisted decisions."""
         statement = select(
             func.count(FraudDecisionRecord.id)
         )
 
-        return int(
-            self._session.scalar(statement) or 0
-        )
+        result = self._session.scalar(statement)
+
+        return int(result or 0)

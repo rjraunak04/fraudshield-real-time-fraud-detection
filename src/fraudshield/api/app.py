@@ -17,18 +17,23 @@ from fraudshield.api.observability import (
 )
 from fraudshield.api.schemas import (
     HealthResponse,
+    OperationalDashboardResponse,
+    OperationalMetricsResponse,
     RawTransactionRequest,
     RealTimeScoreResponse,
     ReasonCodeResponse,
+    RecentDecisionResponse,
     ScoreRequest,
     ScoreResponse,
 )
 from fraudshield.decision.engine import RiskDecisionEngine
 from fraudshield.explainability.reason_codes import ReasonCode
-from fraudshield.persistence import DuplicateDecisionError
-from fraudshield.realtime import (
-    RealTimeFraudResult,
+from fraudshield.metrics import build_operational_metrics
+from fraudshield.persistence import (
+    DuplicateDecisionError,
+    FraudDecisionRepository,
 )
+from fraudshield.realtime import RealTimeFraudResult
 from fraudshield.scoring.service import FraudScore
 from fraudshield.streaming.events import TransactionEvent
 
@@ -68,6 +73,16 @@ class RealTimeService(Protocol):
         ...
 
 
+class MetricsRepositoryFactory(Protocol):
+    """Factory for dashboard decision repository."""
+
+    def __call__(
+        self,
+    ) -> FraudDecisionRepository:
+        """Return dashboard repository."""
+        ...
+
+
 def _unconfigured_scorer() -> ScoringService:
     """Fail safely until a fitted scorer is injected."""
     raise RuntimeError(
@@ -79,6 +94,14 @@ def _unconfigured_realtime_service() -> RealTimeService:
     """Fail safely until the real-time pipeline is injected."""
     raise RuntimeError(
         "FraudShield real-time service is not configured."
+    )
+
+
+def _unconfigured_metrics_repository(
+) -> FraudDecisionRepository:
+    """Fail safely until dashboard storage is injected."""
+    raise RuntimeError(
+        "Operational metrics repository is not configured."
     )
 
 
@@ -98,6 +121,9 @@ def create_app(
         [],
         RealTimeService,
     ] = _unconfigured_realtime_service,
+    metrics_repository_dependency: (
+        MetricsRepositoryFactory
+    ) = _unconfigured_metrics_repository,
 ) -> FastAPI:
     """Create the FraudShield HTTP application."""
     app = FastAPI(
@@ -120,6 +146,7 @@ def create_app(
             request.headers.get("X-Request-ID")
             or new_request_id()
         )
+
         started_at = time.perf_counter()
 
         log_event(
@@ -164,6 +191,7 @@ def create_app(
         response.headers["X-Request-ID"] = (
             request_id
         )
+
         response.headers["X-Process-Time-Ms"] = (
             f"{latency:.3f}"
         )
@@ -263,7 +291,7 @@ def create_app(
 
             reasons: tuple[
                 ReasonCode,
-                ...
+                ...,
             ] = ()
 
             if reason_dependency is not None:
@@ -333,7 +361,7 @@ def create_app(
     def score_raw_transaction(
         request: RawTransactionRequest,
     ) -> RealTimeScoreResponse:
-        """Process one raw transaction through the real-time pipeline."""
+        """Process one raw transaction."""
         event = TransactionEvent(
             transaction_id=request.transaction_id,
             event_time=request.event_time,
@@ -390,6 +418,108 @@ def create_app(
                 decision.policy_version
             ),
         )
+
+    @app.get(
+        "/v1/metrics/operations",
+        response_model=OperationalDashboardResponse,
+        tags=["operations"],
+    )
+    def operational_metrics(
+    ) -> OperationalDashboardResponse:
+        """Return dashboard-ready operational metrics."""
+        try:
+            repository = (
+                metrics_repository_dependency()
+            )
+
+            metrics = build_operational_metrics(
+                repository
+            )
+
+            recent_records = repository.recent(
+                limit=20
+            )
+
+            recent_decisions = [
+                RecentDecisionResponse(
+                    transaction_id=(
+                        record.transaction_id
+                    ),
+                    event_time=record.event_time,
+                    customer_id=record.customer_id,
+                    terminal_id=record.terminal_id,
+                    amount=float(record.amount),
+                    calibrated_probability=float(
+                        record.calibrated_probability
+                    ),
+                    decision=record.decision,
+                    model_version=(
+                        record.model_version
+                    ),
+                    policy_version=(
+                        record.policy_version
+                    ),
+                )
+                for record in recent_records
+            ]
+
+            metrics_response = (
+                OperationalMetricsResponse(
+                    total_transactions=(
+                        metrics.total_transactions
+                    ),
+                    approve_count=(
+                        metrics.approve_count
+                    ),
+                    review_count=(
+                        metrics.review_count
+                    ),
+                    block_count=(
+                        metrics.block_count
+                    ),
+                    approve_rate=(
+                        metrics.approve_rate
+                    ),
+                    review_rate=(
+                        metrics.review_rate
+                    ),
+                    block_rate=(
+                        metrics.block_rate
+                    ),
+                    average_calibrated_probability=(
+                        metrics
+                        .average_calibrated_probability
+                    ),
+                    high_risk_rate=(
+                        metrics.high_risk_rate
+                    ),
+                    total_transaction_amount=(
+                        metrics
+                        .total_transaction_amount
+                    ),
+                    average_transaction_amount=(
+                        metrics
+                        .average_transaction_amount
+                    ),
+                )
+            )
+
+            return OperationalDashboardResponse(
+                metrics=metrics_response,
+                recent_decisions=recent_decisions,
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Operational metrics are unavailable."
+                ),
+            ) from exc
 
     return app
 
