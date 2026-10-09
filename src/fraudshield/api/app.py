@@ -17,19 +17,26 @@ from fraudshield.api.observability import (
 )
 from fraudshield.api.schemas import (
     HealthResponse,
+    RawTransactionRequest,
+    RealTimeScoreResponse,
     ReasonCodeResponse,
     ScoreRequest,
     ScoreResponse,
 )
 from fraudshield.decision.engine import RiskDecisionEngine
 from fraudshield.explainability.reason_codes import ReasonCode
+from fraudshield.persistence import DuplicateDecisionError
+from fraudshield.realtime import (
+    RealTimeFraudResult,
+)
 from fraudshield.scoring.service import FraudScore
+from fraudshield.streaming.events import TransactionEvent
 
 logger = logging.getLogger("fraudshield.api")
 
 
 class ScoringService(Protocol):
-    """Protocol required by the HTTP layer."""
+    """Protocol required by the engineered-feature HTTP layer."""
 
     def score_one(
         self,
@@ -50,10 +57,28 @@ class ReasonService(Protocol):
         ...
 
 
+class RealTimeService(Protocol):
+    """Protocol required by the raw-transaction HTTP layer."""
+
+    def process(
+        self,
+        event: TransactionEvent,
+    ) -> RealTimeFraudResult:
+        """Process one raw transaction."""
+        ...
+
+
 def _unconfigured_scorer() -> ScoringService:
     """Fail safely until a fitted scorer is injected."""
     raise RuntimeError(
         "FraudShield scoring service is not configured."
+    )
+
+
+def _unconfigured_realtime_service() -> RealTimeService:
+    """Fail safely until the real-time pipeline is injected."""
+    raise RuntimeError(
+        "FraudShield real-time service is not configured."
     )
 
 
@@ -69,6 +94,10 @@ def create_app(
     ]
     | None = None,
     decision_engine: RiskDecisionEngine | None = None,
+    realtime_dependency: Callable[
+        [],
+        RealTimeService,
+    ] = _unconfigured_realtime_service,
 ) -> FastAPI:
     """Create the FraudShield HTTP application."""
     app = FastAPI(
@@ -168,7 +197,7 @@ def create_app(
         tags=["system"],
     )
     def readiness() -> HealthResponse:
-        """Return service readiness."""
+        """Return engineered-feature scoring readiness."""
         try:
             scorer_dependency()
         except (
@@ -187,6 +216,33 @@ def create_app(
         return HealthResponse(
             status="ready",
             service="fraudshield",
+        )
+
+    @app.get(
+        "/ready/realtime",
+        response_model=HealthResponse,
+        tags=["system"],
+    )
+    def realtime_readiness() -> HealthResponse:
+        """Return raw-transaction pipeline readiness."""
+        try:
+            realtime_dependency()
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Fraud real-time service "
+                    "is not ready."
+                ),
+            ) from exc
+
+        return HealthResponse(
+            status="ready",
+            service="fraudshield-realtime",
         )
 
     @app.post(
@@ -267,6 +323,72 @@ def create_app(
                 )
                 for reason in decision.reason_codes
             ],
+        )
+
+    @app.post(
+        "/v1/transactions/score",
+        response_model=RealTimeScoreResponse,
+        tags=["realtime"],
+    )
+    def score_raw_transaction(
+        request: RawTransactionRequest,
+    ) -> RealTimeScoreResponse:
+        """Process one raw transaction through the real-time pipeline."""
+        event = TransactionEvent(
+            transaction_id=request.transaction_id,
+            event_time=request.event_time,
+            customer_id=request.customer_id,
+            terminal_id=request.terminal_id,
+            amount=request.amount,
+        )
+
+        try:
+            realtime_service = realtime_dependency()
+            result = realtime_service.process(event)
+
+        except DuplicateDecisionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Transaction has already been processed."
+                ),
+            ) from exc
+
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Real-time fraud processing failed safely."
+                ),
+            ) from exc
+
+        score = result.score
+        decision = result.decision
+
+        return RealTimeScoreResponse(
+            transaction_id=result.transaction_id,
+            action=decision.action.value,
+            raw_probability=score.raw_probability,
+            calibrated_probability=(
+                score.calibrated_probability
+            ),
+            review_threshold=(
+                decision.review_threshold
+            ),
+            block_threshold=(
+                decision.block_threshold
+            ),
+            model_version=decision.model_version,
+            calibration_method=(
+                decision.calibration_method
+            ),
+            policy_version=(
+                decision.policy_version
+            ),
         )
 
     return app

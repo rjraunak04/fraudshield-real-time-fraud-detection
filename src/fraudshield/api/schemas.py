@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+)
 
 from fraudshield.modeling.dataset import MODEL_FEATURE_COLUMNS
 
@@ -68,6 +74,34 @@ class ScoreRequest(BaseModel):
         }
 
 
+class RawTransactionRequest(BaseModel):
+    """One raw transaction submitted to the real-time service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_id: int = Field(ge=0)
+    event_time: datetime
+    customer_id: int = Field(ge=0)
+    terminal_id: int = Field(ge=0)
+    amount: float = Field(ge=0.0)
+
+    @field_validator("amount")
+    @classmethod
+    def validate_amount(
+        cls,
+        value: float,
+    ) -> float:
+        """Reject non-finite transaction amounts."""
+        numeric = float(value)
+
+        if not math.isfinite(numeric):
+            raise ValueError(
+                "Transaction amount must be finite."
+            )
+
+        return numeric
+
+
 class ReasonCodeResponse(BaseModel):
     """Reviewer-facing reason returned by the API."""
 
@@ -97,6 +131,23 @@ class ScoreResponse(BaseModel):
     reason_codes: list[ReasonCodeResponse] = Field(
         default_factory=list
     )
+
+
+class RealTimeScoreResponse(BaseModel):
+    """Response for one raw real-time transaction."""
+
+    transaction_id: int
+    action: str
+
+    raw_probability: float
+    calibrated_probability: float
+
+    review_threshold: float
+    block_threshold: float
+
+    model_version: str
+    calibration_method: str
+    policy_version: str
 
 
 class HealthResponse(BaseModel):
