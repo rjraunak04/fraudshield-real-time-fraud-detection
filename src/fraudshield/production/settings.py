@@ -19,7 +19,7 @@ class ProductionSettings:
     redis_namespace: str = "fraudshield"
 
     @classmethod
-    def from_env(cls) -> "ProductionSettings":
+    def from_env(cls) -> ProductionSettings:
         """Build settings from environment variables without hidden defaults."""
         required = {
             "FRAUDSHIELD_DATABASE_URL": os.getenv("FRAUDSHIELD_DATABASE_URL"),
