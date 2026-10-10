@@ -1,7 +1,6 @@
 """Tests for environment-driven production settings."""
 
 import pytest
-
 from fraudshield.production.settings import ProductionSettings
 
 
