@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from redis import Redis
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from fraudshield.api.app import create_app
@@ -47,6 +49,7 @@ class ProductionContainer:
     """Own long-lived infrastructure and construct request-scoped services."""
 
     settings: ProductionSettings
+    database_engine: Engine
     session_factory: sessionmaker[Session]
     redis_client: Redis
     scorer: FraudScorer
@@ -57,6 +60,19 @@ class ProductionContainer:
     def repository(self) -> FraudDecisionRepository:
         """Return a repository backed by a fresh database session."""
         return FraudDecisionRepository(self.session_factory())
+
+    def readiness_check(self) -> None:
+        """Verify live database and Redis dependencies."""
+        with self.database_engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        self.redis_client.ping()
+
+    def close(self) -> None:
+        """Release production infrastructure resources."""
+        try:
+            self.redis_client.close()
+        finally:
+            self.database_engine.dispose()
 
     def realtime_service(self) -> RealTimeFraudPipeline:
         """Build a real-time service with its own database session."""
@@ -110,6 +126,7 @@ def build_production_container(
 
     return ProductionContainer(
         settings=settings,
+        database_engine=engine,
         session_factory=session_factory,
         redis_client=redis_client,
         scorer=scorer,
@@ -133,4 +150,9 @@ def create_production_app(settings: ProductionSettings | None = None):
         monitoring_dependency=lambda: container.monitoring,
     )
     app.state.production_container = container
+
+    @app.on_event("shutdown")
+    def close_production_dependencies() -> None:
+        container.close()
+
     return app
