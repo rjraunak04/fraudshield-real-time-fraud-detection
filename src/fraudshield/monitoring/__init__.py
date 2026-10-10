@@ -1,5 +1,9 @@
 """FraudShield production monitoring."""
 
+from fraudshield.monitoring.decisions import (
+    ModelDecisionMonitor,
+    ModelDecisionSnapshot,
+)
 from fraudshield.monitoring.drift import (
     DEFAULT_BINS,
     DEFAULT_DRIFT_THRESHOLD,
@@ -30,6 +34,8 @@ __all__ = [
     "DataQualitySnapshot",
     "DriftResult",
     "DriftStatus",
+    "ModelDecisionMonitor",
+    "ModelDecisionSnapshot",
     "ProcessingTimer",
     "RuntimeMetricsSnapshot",
     "RuntimeMonitor",
