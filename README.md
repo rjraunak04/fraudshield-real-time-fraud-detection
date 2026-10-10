@@ -1,21 +1,66 @@
-# FraudShield — Real-Time Fraud Detection & Risk Decision Platform
+# FraudShield
 
-FraudShield is an end-to-end machine-learning system for converting raw financial transactions into calibrated fraud risk, operational decisions, durable audit records, online feature state, and production monitoring.
+### Real-Time Fraud Detection & Risk Decision Platform
 
-The project focuses on the engineering problems around fraud detection: severe class imbalance, temporal leakage, probability calibration, threshold-based decision policy, stateful online features, persistence, observability, failure handling, containerization, and CI/CD.
+FraudShield is a production-style machine-learning system that turns a raw transaction into a leakage-safe feature vector, calibrated fraud probability, operational risk decision, durable audit record, online state update, and observable service response.
 
-> The current model is intentionally reported with its limitations. FraudShield is a production-style portfolio system, not a claim of a deployed banking fraud product.
+It was built to answer a practical ML-engineering question:
 
-## System architecture
+> **How do you move an imbalanced fraud classifier from a notebook into a stateful, testable, observable real-time decision system without leaking future information or hiding model limitations?**
 
-```text
+**Python 3.12 · scikit-learn · FastAPI · PostgreSQL · Redis · Prometheus · Docker · GitHub Actions**
+
+> **Status:** seven-day end-to-end build complete. The system architecture and engineering workflow are production-style; this repository does not claim a deployed banking product or production-grade predictive performance.
+
+---
+
+## At a glance
+
+| Area | Implementation |
+| --- | --- |
+| Problem | Real-time fraud risk decisioning on an imbalanced transaction stream |
+| Data | 1,845,459 synthetic transactions; observed fraud rate ~2.08% |
+| Leakage control | Chronological splits + features computed only from prior history |
+| Model | Balanced HistGradientBoosting |
+| Probability layer | Sigmoid calibration |
+| Decision policy | APPROVE / REVIEW / BLOCK |
+| Online state | Redis customer + terminal history |
+| Durable audit | PostgreSQL + SQLAlchemy |
+| Serving | FastAPI raw-transaction and engineered-feature APIs |
+| Observability | Runtime, data-quality and decision telemetry + Prometheus |
+| Drift | Batch/scheduled PSI evaluation |
+| Reliability | Duplicate protection, failure-ordering tests, recovery runbook |
+| Delivery | Docker, production Compose, GitHub Actions CI |
+
+## The problem
+
+Fraud detection is not only a binary-classification task. A useful transaction system must deal with several problems simultaneously:
+
+1. **Fraud is rare.** Accuracy can look excellent while the model misses the events that matter.
+2. **Transactions are temporal.** Features built with future or current-row information create leakage and unrealistic offline results.
+3. **A score is not an action.** The system needs an explicit operating policy for approval, review and blocking.
+4. **Online features require state.** Customer and terminal history must be available at inference time without contaminating future requests.
+5. **Decisions need an audit trail.** A risk decision should be durable and traceable to its model and policy version.
+6. **Production behavior must be observable.** Data quality, request failures, decision mix and drift need explicit monitoring.
+7. **Failures cross system boundaries.** Database and online-state updates must have documented ordering and recovery behavior.
+
+FraudShield treats those as one end-to-end system rather than presenting only a trained model.
+
+## Solution architecture
+
+~~~text
+                           FRAUDSHIELD
+
 Raw Transaction
       |
       v
-Validation / Data Quality
+Schema Validation + Data-Quality Observation
       |
       v
-Past-Only Online Features <------ Redis state
+Past-Only Online Feature Engineering <---------- Redis
+      |                                      customer / terminal history
+      v
+21-Feature Serving Contract
       |
       v
 Balanced HistGradientBoosting
@@ -24,29 +69,69 @@ Balanced HistGradientBoosting
 Sigmoid Probability Calibration
       |
       v
+Calibrated Fraud Probability
+      |
+      v
 Risk Decision Engine
-  |       |       |
-APPROVE  REVIEW  BLOCK
       |
-      +------> PostgreSQL decision audit
-      |
-      +------> Redis state commit
-      |
-      +------> Runtime / model-decision monitoring
-                         |
-                         v
-                   Prometheus /metrics
-```
+      +----------------+----------------+
+      |                |                |
+   APPROVE           REVIEW           BLOCK
+      |                |                |
+      +----------------+----------------+
+                       |
+                       v
+             PostgreSQL Decision Audit
+                       |
+                       v
+                 Redis State Commit
+                       |
+                       v
+        Runtime / Data Quality / Decision Metrics
+                       |
+                       v
+                Prometheus /metrics
+~~~
 
-The durable database write occurs before the online state commit. PostgreSQL and Redis are separate systems, so this ordering reduces one failure mode but is not a distributed atomic transaction.
+The transaction path intentionally persists the durable decision **before** committing the event to online state. If the database write fails, the transaction is rolled back and Redis state is not intentionally advanced.
 
-## ML methodology
+PostgreSQL and Redis are separate systems, so this is **not** a distributed atomic transaction. A Redis failure after a successful database commit remains an explicit recovery boundary documented in the runbook.
 
-The source dataset is a large synthetic transaction stream inspired by the Fraud Detection Handbook. The generated dataset contains 1,845,459 transactions with an observed fraud rate of about 2.08%.
+## From raw event to decision
 
-FraudShield uses chronological train/validation/locked-test partitions rather than random splitting. Online and offline features are designed around past-only customer and terminal history, with the current transaction excluded from its own historical aggregates.
+A raw inference event contains transaction ID, event time, customer ID, terminal ID and amount. Fraud labels and fraud-scenario identifiers never enter the serving request.
 
-The frozen serving contract is:
+~~~text
+Transaction
+  -> validate event
+  -> read history strictly before event time
+  -> build customer/terminal temporal features
+  -> enforce 21-feature model contract
+  -> generate model score
+  -> calibrate probability
+  -> apply three-way risk policy
+  -> persist decision + model/policy metadata
+  -> commit online state
+  -> emit monitoring telemetry
+~~~
+
+Duplicate transaction IDs are rejected instead of silently creating a second durable decision.
+
+## Leakage-safe ML design
+
+The source stream is synthetic data inspired by the Fraud Detection Handbook. The generated dataset contains **1,845,459 transactions** with an observed fraud rate of approximately **2.08%**.
+
+The core evaluation rule is temporal integrity:
+
+- development, validation and locked-test partitions are chronological;
+- customer and terminal aggregates use only history strictly before the incoming transaction;
+- the current transaction cannot contribute to its own historical features;
+- `TX_FRAUD_SCENARIO` is diagnostic metadata and is never a model feature;
+- the locked test partition was opened only after model, calibration and threshold choices were frozen.
+
+This prevents the common failure mode where offline fraud metrics benefit from information that would not exist at real inference time.
+
+## Frozen model and decision contract
 
 | Component | Frozen value |
 | --- | --- |
@@ -55,16 +140,24 @@ The frozen serving contract is:
 | Model features | 21 |
 | Calibration | Sigmoid |
 | Review threshold | `0.048` |
-| Provisional block threshold | `0.100` |
+| Block threshold | `0.100` — provisional |
 | Policy version | `day-04-three-way-policy-v1` |
 
-The block threshold is provisional; it was not presented as an optimized or validated business threshold.
+Decision semantics:
 
-## Locked-test results
+~~~text
+probability < 0.048          -> APPROVE
+0.048 <= probability < 0.100 -> REVIEW
+probability >= 0.100         -> BLOCK
+~~~
 
-The locked test partition was opened once after model, calibration, and threshold selection were frozen.
+The `0.100` block threshold is deliberately labelled provisional; it is not presented as a validated business optimum.
 
-| Metric | Result |
+## Locked-test evaluation
+
+The repository keeps the model results visible rather than optimizing the story around a single attractive metric.
+
+| Metric | Locked-test result |
 | --- | ---: |
 | Rows | 276,819 |
 | Fraud prevalence | 2.0992% |
@@ -75,125 +168,210 @@ The locked test partition was opened once after model, calibration, and threshol
 | F1 | 0.039447 |
 | False-positive rate | 0.000015 |
 | Fraud transactions captured | 117 / 5,811 |
-| Fraud transaction capture rate | 2.0134% |
 | Fraud amount capture rate | 8.1241% |
 | Brier score | 0.020566 |
 | Log loss | 0.103113 |
 
-Confusion matrix: TN 271,004, FP 4, FN 5,694, TP 117.
+**Confusion matrix:** TN 271,004 · FP 4 · FN 5,694 · TP 117.
 
-These results show a deliberately conservative operating point but weak ranking performance. The high precision must not be read in isolation: recall is only about 2%. Improving the predictive model would require a new experimental cycle and a fresh holdout/versioning strategy rather than tuning against this locked test set.
+### What the result means
 
-## Real-time decision service
+The frozen operating point is extremely conservative: it produces very few false positives and therefore high precision, but captures only about **2% of fraud transactions**. ROC-AUC around **0.524** also shows weak ranking performance.
 
-The primary raw-transaction route is `POST /v1/transactions/score`. A successful request flows through state-aware feature engineering, calibrated scoring, three-way decisioning, durable persistence, and then online-state mutation.
+That limitation is important. FraudShield demonstrates a disciplined ML-system design, not a claim that this model should block real payments. A stronger model should be developed as a new version using a fresh untouched holdout rather than tuning against this locked test set.
 
-Additional service surfaces include:
+## Real-time service
 
-- `POST /v1/score` — score an already engineered 21-feature transaction.
-- `GET /health` — process liveness.
-- `GET /ready` — engineered-feature scorer readiness.
-- `GET /ready/realtime` — real-time pipeline readiness.
-- `GET /metrics` — Prometheus-compatible runtime/data-quality/decision telemetry.
-- `GET /v1/metrics/operations` — dashboard-oriented operational decision metrics.
+The main serving endpoint accepts a raw transaction:
 
-Duplicate transaction identifiers are rejected rather than silently producing a second durable decision.
+`POST /v1/transactions/score`
 
-## Stateful features and persistence
+The service builds the state-aware features, scores and calibrates the transaction, applies the risk policy, persists the decision and then advances online state.
 
-Redis stores online customer and terminal transaction history used by the feature service. Reads are restricted to history strictly before the incoming event time to protect against current-row leakage.
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/transactions/score` | End-to-end raw transaction scoring |
+| `POST /v1/score` | Score an already engineered 21-feature request |
+| `GET /health` | Process liveness |
+| `GET /ready` | Engineered-feature scorer readiness |
+| `GET /ready/realtime` | Real-time pipeline readiness |
+| `GET /metrics` | Prometheus-compatible monitoring |
+| `GET /v1/metrics/operations` | Persisted operational decision metrics |
 
-PostgreSQL stores durable fraud decisions and their model/policy metadata. SQLAlchemy isolates the persistence layer from the API. SQLite and the in-memory state backend are used for deterministic automated integration tests; they are not advertised as the production stores.
+## State, persistence and failure ordering
+
+**Redis** supplies low-latency customer and terminal history for online feature construction. Reads are restricted to observations before the event being scored.
+
+**PostgreSQL** is the durable decision/audit store. Each persisted decision retains the model/policy context required to understand how it was produced.
+
+The critical transaction ordering is:
+
+~~~text
+transform -> score -> decide -> PostgreSQL commit -> Redis state commit
+~~~
+
+Failure behavior is explicit:
+
+| Failure | Expected behavior |
+| --- | --- |
+| Model/calibrator unavailable at startup | Fail fast |
+| Scoring failure | No decision/state mutation |
+| PostgreSQL write failure | Roll back; do not intentionally advance Redis |
+| Duplicate transaction | Reject duplicate decision attempt |
+| Redis failure after DB commit | Durable decision may exist without state update; inspect/reconcile |
+| Monitoring failure | Monitoring is fail-open; transaction truth remains in durable storage |
+
+See `docs/operations-runbook.md` for incident handling and recovery boundaries.
 
 ## Monitoring and drift
 
-FraudShield tracks request outcomes, processing time, duplicate attempts, data-quality violations, prediction volume, APPROVE/REVIEW/BLOCK mix, calibrated probability summaries, high-risk rate, and threshold proximity.
+FraudShield observes more than HTTP uptime. The monitoring layer tracks:
 
-Prometheus exposition is available at `/metrics`. Population Stability Index (PSI) is implemented as a batch/scheduled drift evaluator with operational bands:
+- request successes, failures and processing time;
+- duplicate attempts;
+- data-quality violations and event-time issues;
+- prediction and APPROVE/REVIEW/BLOCK volumes;
+- calibrated probability summaries;
+- high-risk rate and threshold proximity.
 
-- PSI < 0.10: STABLE
-- 0.10 <= PSI < 0.25: WARNING
-- PSI >= 0.25: DRIFT
+Prometheus-compatible telemetry is exposed at `/metrics`.
 
-Drift is an investigation signal. It does not automatically retrain the model or change decision thresholds. The monitoring layer also does not claim live precision/recall because ground-truth fraud labels are not assumed to arrive synchronously.
+Population Stability Index is implemented as a **batch/scheduled** drift evaluator:
 
-## Production packaging
+| PSI | Operational interpretation |
+| ---: | --- |
+| < 0.10 | STABLE |
+| 0.10–0.25 | WARNING |
+| >= 0.25 | DRIFT |
 
-The runtime is packaged in a Python 3.12 slim container and runs as a non-root user. `compose.production.yaml` defines the API, PostgreSQL, and Redis topology with dependency health checks and persistent service volumes.
+A drift signal means investigate. It does **not** automatically retrain the model or change thresholds. The system also does not claim live precision/recall because fraud labels are not assumed to arrive synchronously.
 
-Required runtime inputs are documented in `.env.example`. Model and calibrator artifacts are mounted read-only and are intentionally excluded from the Docker image. Only trusted pickle artifacts should be loaded.
+## Production-style deployment
 
-Example local production-style start:
+The runtime uses a Python 3.12 slim image and runs as a non-root user. `compose.production.yaml` defines:
 
-```powershell
+~~~text
+API
+ |-- PostgreSQL  -> durable decisions
+ |-- Redis       -> online feature state
+ '-- artifacts   -> read-only trusted model/calibrator files
+~~~
+
+Runtime configuration is environment-driven and documented in `.env.example`. Secrets and generated model artifacts are not baked into the image.
+
+Quick start, once the trusted frozen artifacts are available:
+
+~~~powershell
 $env:FRAUDSHIELD_POSTGRES_PASSWORD = "<strong-local-password>"
 docker compose -f compose.production.yaml up --build -d
 docker compose -f compose.production.yaml ps
+
 curl.exe http://localhost:8000/health
 curl.exe http://localhost:8000/ready/realtime
-```
+~~~
 
-This repository packages a production-style topology; it does not claim a currently hosted cloud deployment.
+For the short recruiter-facing walkthrough, use **`docs/demo-guide.md`**.
 
-## CI/CD quality gates
+## CI/CD and verification
 
-GitHub Actions validates the project on a clean Ubuntu runner using Python 3.12. The pipeline installs the package, verifies imports, runs Ruff, executes the full pytest suite, builds the Docker image, starts it, waits for container health, verifies liveness and readiness semantics, confirms non-root execution, captures diagnostics, and stops the container.
+GitHub Actions validates the repository in a clean Ubuntu/Python 3.12 environment.
 
-The production deployment contract and end-to-end smoke path are also covered by automated tests.
+~~~text
+Install package
+      |
+Import verification
+      |
+Ruff
+      |
+Full pytest suite
+      |
+Docker build
+      |
+Container health
+      |
+Liveness / readiness semantics
+      |
+Non-root runtime verification
+      |
+Diagnostics + cleanup
+~~~
 
-## Failure and recovery design
+The automated suite also covers production configuration, deployment contracts, deterministic end-to-end flow, and failure-ordering behavior.
 
-The service fails fast when required model/calibrator artifacts or startup dependencies are unavailable. Scoring failures occur before persistence/state mutation. Database write failures roll back and do not intentionally advance online state.
+## Repository structure
 
-A Redis failure after the database commit is a documented consistency boundary: a durable decision may exist while online state is missing the event. The operational runbook describes inspection and reconciliation rather than pretending PostgreSQL and Redis are transactionally atomic.
+~~~text
+fraudshield-real-time-fraud-detection/
+|
+|-- src/fraudshield/
+|   |-- api/             FastAPI routes, schemas and observability
+|   |-- data/            simulation, validation and temporal splitting
+|   |-- decision/        APPROVE / REVIEW / BLOCK policy
+|   |-- explainability/  reason-code support
+|   |-- features/        offline + online feature engineering
+|   |-- modeling/        leakage-safe modeling dataset
+|   |-- monitoring/      runtime, quality, drift, decision, Prometheus
+|   |-- persistence/     SQLAlchemy durable decision storage
+|   |-- production/      settings, bootstrap and ASGI entrypoint
+|   |-- realtime/        transaction orchestration
+|   |-- scoring/         frozen scoring contract
+|   |-- state/           Redis and in-memory state stores
+|   '-- streaming/       raw transaction event contract
+|
+|-- tests/               unit, integration, failure and deployment coverage
+|-- docs/                architecture, deployment, monitoring and runbooks
+|-- configs/             project/data configuration
+|-- .github/workflows/   CI quality + container gates
+|-- Dockerfile
+|-- compose.yaml
+|-- compose.production.yaml
+|-- pyproject.toml
+'-- .env.example
+~~~
 
-See `docs/operations-runbook.md` for incident triage and recovery guidance.
+## Key engineering decisions
 
-## Repository map
+| Decision | Why it matters |
+| --- | --- |
+| Chronological split | Prevents future information from contaminating evaluation |
+| Past-only features | Makes offline feature logic consistent with real inference constraints |
+| Probability calibration | Gives the decision layer an explicit probability interface |
+| Three-way policy | Separates elevated risk from automatic blocking |
+| Redis + PostgreSQL | Separates low-latency online state from durable audit storage |
+| Persist before state mutation | Avoids advancing feature state when the durable write fails |
+| Explicit model/policy versions | Makes decisions traceable |
+| Fail-open monitoring | Telemetry failures do not become payment-decision failures |
+| Locked-test discipline | Prevents repeated tuning against the final evaluation set |
+| Honest weak-model reporting | Separates ML-system quality from predictive-model quality |
 
-```text
-src/fraudshield/
-  api/             FastAPI schemas, routes, observability
-  data/            simulation, validation, temporal splitting
-  decision/        three-way risk policy
-  explainability/  reviewer-facing reason-code support
-  features/        offline and online feature engineering
-  modeling/        leakage-safe modeling dataset
-  monitoring/      runtime, quality, drift, decision, Prometheus
-  persistence/     SQLAlchemy decision storage
-  production/      environment settings and dependency bootstrap
-  realtime/        transaction orchestration
-  scoring/         frozen scoring contract
-  state/           in-memory and Redis state stores
-  streaming/       raw transaction event contract
+## What is intentionally not claimed
 
-tests/             unit, integration, failure and deployment tests
-docs/              architecture, monitoring, deployment and runbooks
-.github/workflows/ clean CI quality and container gates
-```
+- The current model is **not** presented as production-grade fraud detection.
+- The `0.100` BLOCK threshold is **not** presented as business-validated.
+- PSI is **not** presented as live automatic retraining.
+- PostgreSQL + Redis are **not** presented as one atomic transaction.
+- Offline and online features are **not** claimed to have proven exact numerical parity.
+- The repository is **not** claimed to be currently hosted in a public cloud.
+- Synthetic data is **not** presented as equivalent to a real payment network.
 
-## Engineering decisions worth discussing
+## Next engineering iteration
 
-**Why temporal splitting?** Fraud systems operate forward in time. Random splits can mix future behavior into model development and produce misleading evaluation.
+The next version should be treated as a new model/system release rather than another pass over the existing locked test set:
 
-**Why calibration?** Decision thresholds consume probabilities. Calibration separates probability quality from ranking quality and makes the risk-policy interface explicit.
+1. create a fresh untouched evaluation holdout;
+2. investigate richer temporal and behavioral fraud signals and stronger ranking models;
+3. validate decision thresholds against explicit business costs;
+4. add delayed-label model-performance monitoring;
+5. replace startup schema creation with migrations;
+6. add idempotent PostgreSQL/Redis reconciliation for partial cross-store failures.
 
-**Why Redis plus PostgreSQL?** Redis serves low-latency historical state for online features; PostgreSQL provides durable decision/audit storage. Their different roles are explicit, as is their consistency boundary.
+---
 
-**Why three decisions instead of binary fraud/not-fraud?** Operational systems often need a middle path for manual review rather than treating every elevated score as an automatic block.
+### Project completion
 
-**Why keep weak model results?** The goal is to demonstrate correct evaluation and system design without hiding inconvenient metrics. The locked-test ROC-AUC of about 0.524 and low recall make the current model limitation visible and create a clear next-model-version problem.
+The seven-day FraudShield build is complete across data foundation, leakage-safe ML, calibrated decisioning, real-time stateful serving, durable persistence, observability, failure handling, Docker packaging, CI/CD and production configuration.
 
-## Known limitations
-
-The synthetic fraud scenarios do not reproduce the full complexity of real payment networks. The current model has weak locked-test ranking performance. The block threshold remains provisional. PostgreSQL schema creation currently occurs during bootstrap rather than through a migration framework. PostgreSQL and Redis commits are not distributed-atomic. Live ground-truth performance monitoring and automated cross-store reconciliation are not implemented. The repository also does not claim a public cloud deployment.
-
-## Tech stack
-
-Python 3.12 · pandas · NumPy · scikit-learn · FastAPI · Pydantic · SQLAlchemy · PostgreSQL · Redis · Prometheus · Docker · Docker Compose · pytest · Ruff · GitHub Actions
-
-## Project status
-
-FraudShield's seven-day build is complete: data foundation, leakage-safe ML, calibrated decision policy, real-time stateful serving, durable persistence, monitoring, Docker/CI, production configuration, deployment packaging, failure/recovery controls, and recruiter-facing documentation are all represented in the repository.
-
-For a short system walkthrough, see `docs/demo-guide.md`. The project remains intentionally described as production-style rather than a claim of a currently hosted banking production system.
+**Demo:** `docs/demo-guide.md`  
+**Operations:** `docs/operations-runbook.md`  
+**Production deployment:** `docs/day-07-production-deployment.md`  
+**Final audit:** `docs/day-07-final-audit.md`
