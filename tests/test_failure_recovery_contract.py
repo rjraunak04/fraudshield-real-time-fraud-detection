@@ -22,7 +22,10 @@ class FixedScorer:
         return FraudScore(
             raw_probability=0.01,
             calibrated_probability=0.01,
+            threshold=0.048,
+            is_high_risk=False,
             model_version="test-model",
+            calibration_method="test-calibration",
         )
 
 
