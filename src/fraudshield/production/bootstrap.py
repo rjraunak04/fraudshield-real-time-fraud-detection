@@ -25,11 +25,10 @@ from fraudshield.persistence import (
     create_schema,
     create_session_factory,
 )
+from fraudshield.production.settings import ProductionSettings
 from fraudshield.realtime import RealTimeFraudPipeline
 from fraudshield.scoring.service import FraudScorer
 from fraudshield.state import RedisStateStore
-
-from fraudshield.production.settings import ProductionSettings
 
 
 def _load_pickle(path: Path) -> object:
