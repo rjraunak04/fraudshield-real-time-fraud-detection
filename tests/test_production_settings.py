@@ -1,7 +1,5 @@
 """Tests for environment-driven production settings."""
 
-from __future__ import annotations
-
 import pytest
 
 from fraudshield.production.settings import ProductionSettings
