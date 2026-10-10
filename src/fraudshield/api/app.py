@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from fraudshield.api.observability import (
     elapsed_ms,
@@ -29,6 +29,11 @@ from fraudshield.api.schemas import (
 from fraudshield.decision.engine import RiskDecisionEngine
 from fraudshield.explainability.reason_codes import ReasonCode
 from fraudshield.metrics import build_operational_metrics
+from fraudshield.monitoring import (
+    PROMETHEUS_CONTENT_TYPE,
+    FraudMonitoringService,
+    PrometheusExporter,
+)
 from fraudshield.persistence import (
     DuplicateDecisionError,
     FraudDecisionRepository,
@@ -105,6 +110,20 @@ def _unconfigured_metrics_repository(
     )
 
 
+def _unconfigured_prometheus_exporter() -> PrometheusExporter:
+    """Fail safely until Prometheus monitoring is injected."""
+    raise RuntimeError(
+        "Prometheus monitoring is not configured."
+    )
+
+
+def _unconfigured_monitoring_service() -> FraudMonitoringService:
+    """Fail safely until live monitoring is injected."""
+    raise RuntimeError(
+        "Fraud monitoring service is not configured."
+    )
+
+
 def create_app(
     *,
     scorer_dependency: Callable[
@@ -124,6 +143,14 @@ def create_app(
     metrics_repository_dependency: (
         MetricsRepositoryFactory
     ) = _unconfigured_metrics_repository,
+    prometheus_dependency: Callable[
+        [],
+        PrometheusExporter,
+    ] = _unconfigured_prometheus_exporter,
+    monitoring_dependency: Callable[
+        [],
+        FraudMonitoringService,
+    ] = _unconfigured_monitoring_service,
 ) -> FastAPI:
     """Create the FraudShield HTTP application."""
     app = FastAPI(
@@ -273,6 +300,33 @@ def create_app(
             service="fraudshield-realtime",
         )
 
+    @app.get(
+        "/metrics",
+        tags=["monitoring"],
+        include_in_schema=False,
+    )
+    def prometheus_metrics() -> Response:
+        """Expose Prometheus-compatible monitoring metrics."""
+        try:
+            exporter = prometheus_dependency()
+            payload = exporter.render()
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Prometheus monitoring is unavailable."
+                ),
+            ) from exc
+
+        return Response(
+            content=payload,
+            media_type=PROMETHEUS_CONTENT_TYPE,
+        )
+
     @app.post(
         "/v1/score",
         response_model=ScoreResponse,
@@ -361,7 +415,7 @@ def create_app(
     def score_raw_transaction(
         request: RawTransactionRequest,
     ) -> RealTimeScoreResponse:
-        """Process one raw transaction."""
+        """Process one raw transaction with live monitoring."""
         event = TransactionEvent(
             transaction_id=request.transaction_id,
             event_time=request.event_time,
@@ -370,11 +424,39 @@ def create_app(
             amount=request.amount,
         )
 
+        monitor: FraudMonitoringService | None = None
+
+        try:
+            monitor = monitoring_dependency()
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ):
+            monitor = None
+
+        if monitor is not None:
+            monitor.inspect_event(event)
+
+        started_at = time.perf_counter()
+
         try:
             realtime_service = realtime_dependency()
             result = realtime_service.process(event)
 
         except DuplicateDecisionError as exc:
+            processing_time_seconds = (
+                time.perf_counter() - started_at
+            )
+
+            if monitor is not None:
+                monitor.record_duplicate()
+                monitor.record_failure(
+                    processing_time_seconds=(
+                        processing_time_seconds
+                    ),
+                )
+
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -387,12 +469,35 @@ def create_app(
             ValueError,
             RuntimeError,
         ) as exc:
+            processing_time_seconds = (
+                time.perf_counter() - started_at
+            )
+
+            if monitor is not None:
+                monitor.record_failure(
+                    processing_time_seconds=(
+                        processing_time_seconds
+                    ),
+                )
+
             raise HTTPException(
                 status_code=500,
                 detail=(
                     "Real-time fraud processing failed safely."
                 ),
             ) from exc
+
+        processing_time_seconds = (
+            time.perf_counter() - started_at
+        )
+
+        if monitor is not None:
+            monitor.record_success(
+                result,
+                processing_time_seconds=(
+                    processing_time_seconds
+                ),
+            )
 
         score = result.score
         decision = result.decision
