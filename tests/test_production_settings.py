@@ -4,7 +4,6 @@ import pytest
 
 from fraudshield.production.settings import ProductionSettings
 
-
 _REQUIRED = {
     "FRAUDSHIELD_DATABASE_URL": "sqlite:///fraudshield.db",
     "FRAUDSHIELD_REDIS_URL": "redis://localhost:6379/0",
