@@ -194,6 +194,6 @@ Python 3.12 · pandas · NumPy · scikit-learn · FastAPI · Pydantic · SQLAlch
 
 ## Project status
 
-Day 01–06 established the data, leakage-safe ML, calibrated decision policy, real-time stateful service, persistence, monitoring, Docker, and CI/CD layers. Day 07 adds production configuration, service composition, deployment packaging, end-to-end smoke testing, failure/recovery controls, and recruiter-facing documentation.
+FraudShield's seven-day build is complete: data foundation, leakage-safe ML, calibrated decision policy, real-time stateful serving, durable persistence, monitoring, Docker/CI, production configuration, deployment packaging, failure/recovery controls, and recruiter-facing documentation are all represented in the repository.
 
-The final release audit and demo/interview packaging are handled as separate Day-07 checkpoints.
+For a short system walkthrough, see `docs/demo-guide.md`. The project remains intentionally described as production-style rather than a claim of a currently hosted banking production system.
