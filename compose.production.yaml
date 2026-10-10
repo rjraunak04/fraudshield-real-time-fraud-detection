@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: fraudshield
+      POSTGRES_USER: fraudshield
+      POSTGRES_PASSWORD: ${FRAUDSHIELD_POSTGRES_PASSWORD:?set FRAUDSHIELD_POSTGRES_PASSWORD}
+    volumes:
+      - fraudshield-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraudshield -d fraudshield"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - fraudshield-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - sh
+      - -c
+      - exec uvicorn fraudshield.production.asgi:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1
+    environment:
+      FRAUDSHIELD_ENV: production
+      FRAUDSHIELD_DATABASE_URL: postgresql+psycopg://fraudshield:${FRAUDSHIELD_POSTGRES_PASSWORD}@postgres:5432/fraudshield
+      FRAUDSHIELD_REDIS_URL: redis://redis:6379/0
+      FRAUDSHIELD_REDIS_NAMESPACE: fraudshield
+      FRAUDSHIELD_MODEL_ARTIFACT: /app/artifacts/fraud_model.pkl
+      FRAUDSHIELD_CALIBRATOR_ARTIFACT: /app/artifacts/fraud_calibrator.pkl
+      PORT: "8000"
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready/realtime', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  fraudshield-postgres:
+  fraudshield-redis:
